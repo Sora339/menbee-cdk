@@ -11,6 +11,8 @@ import {
   aws_certificatemanager as acm,
   aws_route53 as route53,
   aws_route53_targets as targets,  // 追加
+  aws_ssm as ssm,  // Parameter Store用に追加
+  aws_secretsmanager as secretsmanager,  // Secrets Manager用に追加
   Duration,
   CfnOutput,
 } from 'aws-cdk-lib';
@@ -37,7 +39,7 @@ export class DockerImageDeploymentStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN,
     });
 
-    // 自動Dockerイメージデプロイメント
+    // 自動Dockerイメージデプロイメント（GitHub Actions使用時はコメントアウト推奨）
     new imagedeploy.DockerImageDeployment(this, "DeployDockerImage", {
       source: imagedeploy.Source.directory(
         path.join(__dirname, '../../Menbee') // CDKからみてMenbeeディレクトリを指定
@@ -214,6 +216,12 @@ export class DockerImageDeploymentStack extends Stack {
     );
 
     //**************************************************** */
+    // Secrets Manager 参照の定義
+    //**************************************************** */
+    // 全ての環境変数をSecrets Managerから取得
+    const appSecrets = secretsmanager.Secret.fromSecretNameV2(this, 'AppSecrets', 'nextjs-app/env');
+
+    //**************************************************** */
     // EC2 Task Definition & Service
     //**************************************************** */
     const taskRole = new iam.Role(this, 'TaskRole', {
@@ -222,6 +230,18 @@ export class DockerImageDeploymentStack extends Stack {
         iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy')
       ]
     });
+
+    // Secrets Manager読み取り権限を追加
+    taskRole.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'secretsmanager:GetSecretValue',
+        'secretsmanager:DescribeSecret'
+      ],
+      resources: [
+        `arn:aws:secretsmanager:${this.region}:${this.account}:secret:nextjs-app/env*`
+      ]
+    }));
 
     // ECS Exec用のSSM権限を追加
     taskRole.addToPolicy(new iam.PolicyStatement({
@@ -259,13 +279,23 @@ export class DockerImageDeploymentStack extends Stack {
       essential: true,
       startTimeout: Duration.minutes(10),
       stopTimeout: Duration.minutes(2),
+      // 公開可能な環境変数（平文で保存される）
       environment: {
-        'NODE_ENV': 'production',
-        'PORT': '3000',
-        'HOSTNAME': '0.0.0.0',
-        'NEXT_TELEMETRY_DISABLED': '1',
+        'NODE_ENV': 'production',           // Node.js実行環境
+        'PORT': '3000',                     // アプリケーションポート
+        'HOSTNAME': '0.0.0.0',             // バインドするホスト名
+        'NEXT_TELEMETRY_DISABLED': '1',    // Next.jsテレメトリ無効化
       },
-      // ヘルスチェックを無効化（テスト用）
+      // 全ての環境変数をSecrets Managerから取得
+      secrets: {
+        'AUTH_SECRET': ecs.Secret.fromSecretsManager(appSecrets, 'AUTH_SECRET'),           // NextAuth.js認証秘密鍵
+        'NEXTAUTH_URL': ecs.Secret.fromSecretsManager(appSecrets, 'NEXTAUTH_URL'),         // NextAuth.js URL設定
+        'AUTH_GOOGLE_ID': ecs.Secret.fromSecretsManager(appSecrets, 'AUTH_GOOGLE_ID'),      // Google OAuth クライアントID
+        'AUTH_GOOGLE_SECRET': ecs.Secret.fromSecretsManager(appSecrets, 'AUTH_GOOGLE_SECRET'), // Google OAuth クライアントシークレット
+        'DATABASE_URL': ecs.Secret.fromSecretsManager(appSecrets, 'DATABASE_URL'),         // データベース接続URL
+        'AUTH_TRUST_HOST': ecs.Secret.fromSecretsManager(appSecrets, 'AUTH_TRUST_HOST'),    // NextAuth.js ホスト信頼設定
+      },
+      // ヘルスチェック設定（テスト用に無効化）
       healthCheck: {
         command: ['CMD-SHELL', 'exit 0'],
         interval: Duration.seconds(30),
