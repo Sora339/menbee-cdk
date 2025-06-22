@@ -9,9 +9,6 @@ import {
   aws_elasticloadbalancingv2 as elbv2,
   aws_autoscaling as autoscaling,
   aws_certificatemanager as acm,
-  aws_route53 as route53,
-  aws_route53_targets as targets,  // 追加
-  aws_ssm as ssm,  // Parameter Store用に追加
   aws_secretsmanager as secretsmanager,  // Secrets Manager用に追加
   Duration,
   CfnOutput,
@@ -53,23 +50,8 @@ export class DockerImageDeploymentStack extends Stack {
     // VPC
     //**************************************************** */
     const vpc = new ec2.Vpc(this, 'NextjsVpc', {
-      maxAzs: 2,
+      maxAzs: 1,
     });
-
-    //**************************************************** */
-    // Cloudflare使用のため、Route 53とSSL証明書をコメントアウト
-    //**************************************************** */
-    /*
-    const hostedZone = new route53.HostedZone(this, 'HostedZone', {
-      zoneName: domainName,
-    });
-
-    const certificate = new acm.Certificate(this, 'Certificate', {
-      domainName: domainName,
-      subjectAlternativeNames: [`www.${domainName}`],
-      validation: acm.CertificateValidation.fromDns(hostedZone),
-    });
-    */
 
     //**************************************************** */
     // ECS Cluster
@@ -129,15 +111,12 @@ export class DockerImageDeploymentStack extends Stack {
     cluster.addAsgCapacityProvider(capacityProvider);
 
     //**************************************************** */
-    // SSL証明書（ACM）をコメントアウト - Cloudflareが処理
+    // SSL証明書（ACM）
     //**************************************************** */
-    /*
-    const certificate = new acm.Certificate(this, 'Certificate', {
+    const certificate = new acm.Certificate(this, 'SslCertificate', {
       domainName: domainName,
-      subjectAlternativeNames: [`www.${domainName}`],
-      validation: acm.CertificateValidation.fromDns(hostedZone),
+      validation: acm.CertificateValidation.fromDns(),
     });
-    */
 
     //**************************************************** */
     // ALB（Application Load Balancer）
@@ -147,11 +126,10 @@ export class DockerImageDeploymentStack extends Stack {
       allowAllOutbound: true,
     });
 
-    // HTTP (80) のみ許可 - CloudflareがHTTPS終端
     albSecurityGroup.addIngressRule(
       ec2.Peer.anyIpv4(),
-      ec2.Port.tcp(80),
-      "Allow HTTP traffic from Cloudflare"
+      ec2.Port.tcp(443), // HTTPS
+      "Allow HTTPS traffic from Cloudflare"
     );
 
     const alb = new elbv2.ApplicationLoadBalancer(this, 'alb', {
@@ -161,31 +139,21 @@ export class DockerImageDeploymentStack extends Stack {
       vpc
     });
 
-    // HTTPリスナーのみ（CloudflareがHTTPS処理）
-    const httpListener = alb.addListener('HttpListener', {
-      port: 80,
-      open: true,
-    });
-
-    /*
-    // HTTPSリスナーをコメントアウト
+    // 3. HTTPS リスナー追加
     const httpsListener = alb.addListener('HttpsListener', {
       port: 443,
+      protocol: elbv2.ApplicationProtocol.HTTPS,
       certificates: [certificate],
-      open: true,
     });
 
-    // HTTPからHTTPSへのリダイレクトも不要
+    // 4. HTTP → HTTPS リダイレクト
     alb.addListener('HttpListener', {
       port: 80,
-      open: true,
       defaultAction: elbv2.ListenerAction.redirect({
         protocol: 'HTTPS',
         port: '443',
-        permanent: true,
       }),
     });
-    */
 
     //**************************************************** */
     // サービス用セキュリティグループ
@@ -288,12 +256,12 @@ export class DockerImageDeploymentStack extends Stack {
       },
       // 全ての環境変数をSecrets Managerから取得
       secrets: {
-        'AUTH_SECRET': ecs.Secret.fromSecretsManager(appSecrets, 'AUTH_SECRET'),           // NextAuth.js認証秘密鍵
-        'NEXTAUTH_URL': ecs.Secret.fromSecretsManager(appSecrets, 'NEXTAUTH_URL'),         // NextAuth.js URL設定
-        'AUTH_GOOGLE_ID': ecs.Secret.fromSecretsManager(appSecrets, 'AUTH_GOOGLE_ID'),      // Google OAuth クライアントID
-        'AUTH_GOOGLE_SECRET': ecs.Secret.fromSecretsManager(appSecrets, 'AUTH_GOOGLE_SECRET'), // Google OAuth クライアントシークレット
-        'DATABASE_URL': ecs.Secret.fromSecretsManager(appSecrets, 'DATABASE_URL'),         // データベース接続URL
-        'AUTH_TRUST_HOST': ecs.Secret.fromSecretsManager(appSecrets, 'AUTH_TRUST_HOST'),    // NextAuth.js ホスト信頼設定
+        'AUTH_SECRET': ecs.Secret.fromSecretsManager(appSecrets, 'AUTH_SECRET'),
+        'NEXTAUTH_URL': ecs.Secret.fromSecretsManager(appSecrets, 'NEXTAUTH_URL'),
+        'AUTH_GOOGLE_ID': ecs.Secret.fromSecretsManager(appSecrets, 'AUTH_GOOGLE_ID'),
+        'AUTH_GOOGLE_SECRET': ecs.Secret.fromSecretsManager(appSecrets, 'AUTH_GOOGLE_SECRET'),
+        'DATABASE_URL': ecs.Secret.fromSecretsManager(appSecrets, 'DATABASE_URL'),
+        'AUTH_TRUST_HOST': ecs.Secret.fromSecretsManager(appSecrets, 'AUTH_TRUST_HOST'),
       },
       // ヘルスチェック設定（テスト用に無効化）
       healthCheck: {
@@ -316,42 +284,21 @@ export class DockerImageDeploymentStack extends Stack {
       ],
     });
 
-    // HTTPリスナーにターゲットグループを追加
-    httpListener.addTargets('EcsTargetGroup', {
+    httpsListener.addTargets('EcsTargetGroup', {
       port: 80,
       protocol: elbv2.ApplicationProtocol.HTTP,
       targets: [service],
       healthCheck: {
         path: "/",
-        interval: Duration.seconds(120), // 間隔を大幅に延長
-        timeout: Duration.seconds(60), // タイムアウトを延長
+        interval: Duration.seconds(120),
+        timeout: Duration.seconds(60),
         healthyThresholdCount: 2,
-        unhealthyThresholdCount: 10, // 失敗許容回数を大幅に増加
+        unhealthyThresholdCount: 10,
         port: "traffic-port",
         protocol: elbv2.Protocol.HTTP,
       },
-      deregistrationDelay: Duration.seconds(300), // 登録解除の遅延を延長
+      deregistrationDelay: Duration.seconds(300),
     });
-
-    //**************************************************** */
-    // Route 53 レコード（Cloudflare使用のためコメントアウト）
-    //**************************************************** */
-    /*
-    new route53.ARecord(this, 'AliasRecord', {
-      zone: hostedZone,
-      target: route53.RecordTarget.fromAlias(
-        new targets.LoadBalancerTarget(alb)
-      ),
-    });
-
-    new route53.ARecord(this, 'WwwAliasRecord', {
-      zone: hostedZone,
-      recordName: 'www',
-      target: route53.RecordTarget.fromAlias(
-        new targets.LoadBalancerTarget(alb)
-      ),
-    });
-    */
 
     //**************************************************** */
     // 出力
@@ -365,13 +312,5 @@ export class DockerImageDeploymentStack extends Stack {
       value: `https://${domainName}`,
       description: 'HTTPS URL (handled by Cloudflare)',
     });
-
-    /*
-    // SSL証明書情報（Cloudflare使用のためコメントアウト）
-    new CfnOutput(this, 'CertificateArn', {
-      value: certificate.certificateArn,
-      description: 'SSL Certificate ARN',
-    });
-    */
   }
 }
