@@ -50,7 +50,7 @@ export class DockerImageDeploymentStack extends Stack {
     // VPC
     //**************************************************** */
     const vpc = new ec2.Vpc(this, 'NextjsVpc', {
-      maxAzs: 1,
+      maxAzs: 2,
     });
 
     //**************************************************** */
